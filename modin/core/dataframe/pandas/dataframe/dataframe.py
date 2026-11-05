@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Hashable, List, Optional, Unio
 import numpy as np
 import pandas
 from pandas._libs.lib import no_default
-from pandas.api.types import is_object_dtype
+from pandas.api.types import is_object_dtype, union_categoricals
 from pandas.core.dtypes.common import is_dtype_equal, is_list_like, is_numeric_dtype
 from pandas.core.indexes.api import Index, RangeIndex
 
@@ -4720,6 +4720,213 @@ class PandasDataframe(
                     df = df.set_axis(axis=axis, labels=external_index, copy=False)
 
         return df
+
+    def to_pandas_batches(self, batch_size: int):
+        """
+        Lazily convert this Modin DataFrame to an iterator of pandas DataFrames,
+        each containing at most `batch_size` rows in the original row order.
+
+        Only the partitions required to produce the next batch are materialized,
+        so the whole frame is never collected to the driver. Concatenating all
+        of the yielded batches gives the same result as ``to_pandas``: the row
+        index, column order (including duplicate column labels), dtypes and data
+        are all preserved. The yielded pandas DataFrames are independent copies,
+        so mutating them does not affect this Modin DataFrame.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each yielded pandas DataFrame. Must be a
+            positive integer.
+
+        Returns
+        -------
+        iterator of pandas.DataFrame
+            Row batches, in the original row order. Every batch contains at
+            most `batch_size` rows (the last one may contain fewer); an empty
+            frame produces a single empty batch that keeps its columns/dtypes.
+        """
+        if isinstance(batch_size, bool) or not isinstance(
+            batch_size, (int, np.integer)
+        ):
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size!r}"
+            )
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size}"
+            )
+        return self._to_pandas_batches(int(batch_size))
+
+    @staticmethod
+    def _categorical_dtypes_getter(df):
+        """Return the categorical dtypes of every column of a remote block (metadata only)."""
+        return [
+            dtype if isinstance(dtype, pandas.CategoricalDtype) else None
+            for dtype in df.dtypes
+        ]
+
+    def _get_categorical_categories_union(self, partitions):
+        """
+        Compute the union of categorical categories for every column position.
+
+        Only block metadata (the columns' dtypes/categories) is pulled from the
+        partitions, never their data. This mirrors the categorical unification
+        done by :func:`modin.core.dataframe.pandas.utils.concatenate` when the
+        whole frame is converted with ``to_pandas``.
+
+        Parameters
+        ----------
+        partitions : np.ndarray
+            A 2D NumPy array of partitions.
+
+        Returns
+        -------
+        dict
+            Mapping from global column position to the unioned categories.
+        """
+        if partitions.size == 0 or partitions.shape[1] == 0:
+            return {}
+
+        mgr = self._partition_mgr_cls
+        widths = self.column_widths
+        offsets = [0]
+        for width in widths[:-1]:
+            offsets.append(offsets[-1] + width)
+
+        getter = mgr.preprocess_func(self._categorical_dtypes_getter)
+        row_lengths = self.row_lengths
+
+        categorical_dtypes = {}
+        non_categorical_positions = set()
+        for row_idx in range(partitions.shape[0]):
+            group_has_rows = row_lengths[row_idx] > 0
+            applied = [block.apply(getter) for block in partitions[row_idx]]
+            block_dtypes = mgr.get_objects_from_partitions(applied)
+            for col_idx, dtypes in enumerate(block_dtypes):
+                if dtypes is None:
+                    continue
+                col_offset = offsets[col_idx] if col_idx < len(offsets) else 0
+                for local_pos, dtype in enumerate(dtypes):
+                    position = col_offset + local_pos
+                    if dtype is None:
+                        non_categorical_positions.add(position)
+                    else:
+                        categorical_dtypes.setdefault(position, []).append(
+                            (dtype, group_has_rows)
+                        )
+
+        union = {}
+        for position, entries in categorical_dtypes.items():
+            all_categorical_parts_are_empty = None
+            for _, group_has_rows in entries:
+                part_is_empty = not group_has_rows
+                if all_categorical_parts_are_empty is None:
+                    all_categorical_parts_are_empty = part_is_empty
+                else:
+                    all_categorical_parts_are_empty &= part_is_empty
+            # same special case as in `concatenate`: some partitions lost the
+            # categorical dtype and the remaining categorical parts are empty
+            if (
+                position in non_categorical_positions
+                and all_categorical_parts_are_empty
+            ):
+                continue
+            dtypes = [dtype for dtype, _ in entries]
+            if len(dtypes) == 1:
+                categories = dtypes[0].categories
+            else:
+                categories = union_categoricals(
+                    [pandas.Categorical([], dtype=dtype) for dtype in dtypes]
+                ).categories
+            union[position] = categories
+        return union
+
+    def _to_pandas_batches(self, batch_size: int):
+        """
+        Generator backing :meth:`to_pandas_batches`.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each yielded batch.
+
+        Yields
+        ------
+        pandas.DataFrame
+        """
+        # Snapshot the partition grid and axes, so that iteration is not
+        # affected by operations on this frame after the iterator was created.
+        partitions = self._partitions
+        columns = self.columns
+        index = self.index
+
+        if len(index) == 0:
+            # A single empty batch preserving columns, index metadata and dtypes.
+            empty_df = pandas.DataFrame(columns=columns, index=index)
+            if len(columns) > 0 and self.has_materialized_dtypes:
+                empty_df = empty_df.astype(self.dtypes)
+            yield empty_df
+            return
+
+        if len(columns) == 0:
+            # A columnless frame only carries index labels; slice the index
+            # metadata (no partition data has to be materialized).
+            for start in range(0, len(index), batch_size):
+                yield pandas.DataFrame(index=index[start : start + batch_size])
+            return
+
+        # Metadata-only pass: unify categorical categories so each batch's
+        # dtypes match the result of a full `to_pandas` conversion. Note that
+        # the frame's dtypes cache may disagree with the actual block dtypes
+        # (e.g. after a concat of frames with different categories), so the
+        # blocks are inspected directly rather than trusting the cache.
+        unioned_categories = self._get_categorical_categories_union(partitions)
+
+        mgr = self._partition_mgr_cls
+        carry = None
+        emitted_rows = 0
+
+        for row_idx in range(partitions.shape[0]):
+            # Materialize only this row of partitions (all column partitions
+            # of this row partition); the remaining rows stay untouched.
+            chunk = mgr.to_pandas(partitions[row_idx : row_idx + 1])
+            if chunk.shape[1] == 0:
+                # Zero-width row of partitions (frame without columns is
+                # handled above), it contributes no data.
+                continue
+
+            # Replicate the categorical unification done by `to_pandas`.
+            for position, categories in unioned_categories.items():
+                chunk.isetitem(
+                    position,
+                    pandas.Categorical(
+                        chunk.iloc[:, position], categories=categories
+                    ),
+                )
+            # Propagate the external column labels the same way `to_pandas` does.
+            chunk.columns = columns
+
+            if carry is not None:
+                chunk = pandas.concat([carry, chunk])
+                carry = None
+
+            while len(chunk) >= batch_size:
+                batch = chunk.iloc[:batch_size].copy()
+                chunk = chunk.iloc[batch_size:]
+                batch.index = index[
+                    emitted_rows : emitted_rows + batch_size
+                ]
+                emitted_rows += len(batch)
+                yield batch
+
+            if len(chunk) > 0:
+                carry = chunk
+
+        if carry is not None:
+            batch = carry.copy()
+            batch.index = index[emitted_rows : emitted_rows + len(batch)]
+            yield batch
 
     def to_numpy(self, **kwargs):
         """

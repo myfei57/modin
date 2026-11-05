@@ -209,6 +209,41 @@ class NativeQueryCompiler(BaseQueryCompiler):
         # improvement on large data.
         return self._modin_frame.copy(deep=NativePandasDeepCopy.get())
 
+    def to_pandas_batches(self, batch_size: int):
+        """
+        Lazily convert the native dataframe to an iterator of pandas DataFrames
+        with at most `batch_size` rows each.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each yielded pandas DataFrame.
+
+        Returns
+        -------
+        iterator of pandas.DataFrame
+        """
+        if isinstance(batch_size, bool) or not isinstance(
+            batch_size, (int, np.integer)
+        ):
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size!r}"
+            )
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size}"
+            )
+        return self._to_pandas_batches(int(batch_size))
+
+    def _to_pandas_batches(self, batch_size: int):
+        df = self._modin_frame
+        if len(df) == 0:
+            # A single empty batch preserving columns, index metadata and dtypes.
+            yield df.iloc[:0].copy()
+            return
+        for start in range(0, len(df), batch_size):
+            yield df.iloc[start : start + batch_size].copy()
+
     @classmethod
     def from_pandas(cls, df, data_cls):
         return cls(df)

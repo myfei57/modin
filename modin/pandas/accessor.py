@@ -229,6 +229,49 @@ class ModinAPI:
         """
         return self._data._to_pandas()
 
+    def to_pandas_batches(self, batch_size: int):
+        """
+        Lazily convert a Modin DataFrame to an iterator of pandas DataFrames,
+        each containing at most `batch_size` rows in the original row order.
+
+        The iterator is intended for writing large Modin results into external
+        systems batch by batch. Only the data required for the next batch is
+        materialized, so creating the iterator does not collect the whole frame
+        locally and stopping iteration early (e.g. via ``break`` or
+        ``iterator.close()``) prevents further batches from being pulled.
+
+        Each batch preserves the original row index, column order (including
+        duplicate column labels) and dtypes, contains at most `batch_size`
+        rows, and the final batch may be shorter. Concatenating all of the
+        batches gives the same result as :meth:`to_pandas`. The batches are
+        independent copies, so modifying them does not affect the source
+        Modin DataFrame. An empty frame yields a single empty batch that keeps
+        its columns and dtypes.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each batch. Must be a positive integer;
+            a ``ValueError`` is raised before any data is consumed otherwise.
+
+        Returns
+        -------
+        iterator of pandas.DataFrame
+
+        Examples
+        --------
+        Write a large Modin DataFrame to an external system in batches of 10000
+        rows:
+
+        >>> for batch in modin_df.modin.to_pandas_batches(batch_size=10000):
+        ...     external_system.write(batch)
+        """
+        if not isinstance(self._data, pd.DataFrame):
+            raise NotImplementedError(
+                "`to_pandas_batches` is only supported for Modin DataFrames."
+            )
+        return self._data._to_pandas_batches(batch_size)
+
     def to_ray(self):
         """
         Convert a Modin DataFrame/Series to a Ray Dataset.

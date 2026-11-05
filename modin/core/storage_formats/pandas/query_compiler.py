@@ -382,6 +382,22 @@ class PandasQueryCompiler(BaseQueryCompiler):
     def to_pandas(self):
         return self._modin_frame.to_pandas()
 
+    def to_pandas_batches(self, batch_size: int):
+        """
+        Lazily convert the distributed dataframe to an iterator of pandas
+        DataFrames with at most `batch_size` rows each.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each yielded pandas DataFrame.
+
+        Returns
+        -------
+        iterator of pandas.DataFrame
+        """
+        return self._modin_frame.to_pandas_batches(batch_size)
+
     @classmethod
     def from_pandas(cls, df, data_cls):
         return cls(data_cls.from_pandas(df))

@@ -3202,6 +3202,42 @@ class DataFrame(BasePandasDataset):
         """
         return self._query_compiler.to_pandas()
 
+    def _to_pandas_batches(self, batch_size: int) -> Iterator[pandas.DataFrame]:
+        """
+        Lazily convert Modin ``DataFrame`` to an iterator of pandas ``DataFrame``
+        batches, each containing at most `batch_size` rows in the original order.
+
+        Recommended conversion method: `dataframe.modin.to_pandas_batches()`.
+
+        Only the data required for the next batch is materialized; concatenating
+        all of the batches gives the same result as ``_to_pandas``.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum number of rows in each batch. Must be a positive integer.
+
+        Returns
+        -------
+        iterator of pandas.DataFrame
+
+        Notes
+        -----
+        The argument is validated before any data is consumed, so a non-positive
+        batch size raises immediately rather than on the first iteration.
+        """
+        if isinstance(batch_size, bool) or not isinstance(
+            batch_size, (int, np.integer)
+        ):
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size!r}"
+            )
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive integer, got: {batch_size}"
+            )
+        return self._query_compiler.to_pandas_batches(int(batch_size))
+
     def _validate_eval_query(self, expr, **kwargs) -> None:
         """
         Validate the arguments of ``eval`` and ``query`` functions.
