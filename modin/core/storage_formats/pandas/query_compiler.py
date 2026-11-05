@@ -426,6 +426,30 @@ class PandasQueryCompiler(BaseQueryCompiler):
         else:
             return sum(self._modin_frame.column_widths)
 
+    def get_partition_sizes(self) -> tuple[list[int], list[int]]:
+        """
+        Get the sizes of the physical row/column partitions in their current order.
+
+        The first returned list contains the number of rows of every row
+        partition and the second list contains the number of columns of every
+        column partition, both arranged in the physical partitions order.
+
+        This is a read-only introspection: if a partition size is not cached
+        it is computed through the standard per-partition
+        ``length()``/``width()`` mechanism, which only materializes integer
+        metadata on the driver. It never collects the partition data to the
+        driver, never repartitions and never modifies the data, index or
+        columns of the frame.
+
+        Returns
+        -------
+        row_lengths : list of int
+        column_widths : list of int
+            Empty lists if the frame has no partitions along the respective axis.
+        """
+        frame = self._modin_frame
+        return list(frame.row_lengths), list(frame.column_widths)
+
     @property
     def dtypes(self) -> pandas.Series:
         return self._modin_frame.dtypes

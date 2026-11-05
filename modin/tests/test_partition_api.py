@@ -18,7 +18,9 @@ import pytest
 import modin.pandas as pd
 from modin.config import Engine, NPartitions
 from modin.core.execution.dispatching.factories.dispatcher import FactoryDispatcher
+from modin.core.storage_formats.pandas.query_compiler import PandasQueryCompiler
 from modin.distributed.dataframe.pandas import from_partitions, unwrap_partitions
+from modin.pandas.accessor import PartitionAxisStats, PartitionLayout
 from modin.pandas.indexing import compute_sliced_len
 from modin.tests.pandas.utils import df_equals, test_data
 
@@ -247,3 +249,208 @@ def test_mask_preserve_cache(row_labels, col_labels, is_length_future, is_width_
     masked_partition._width_cache = None
     assert expected_length == masked_partition.length()
     assert expected_width == masked_partition.width()
+
+
+def _build_uneven_partitioned_frame():
+    """Build a 16x8 frame with uneven row/column partition sizes."""
+    row_sizes = [1, 3, 10, 2]
+    col_sizes = [2, 5, 1]
+    pdf = pandas.DataFrame(
+        np.arange(16 * 8).reshape(16, 8),
+        index=[f"row{i}" for i in range(16)],
+        columns=[f"col{i}" for i in range(8)],
+    )
+    row_bounds = np.cumsum([0] + row_sizes)
+    col_bounds = np.cumsum([0] + col_sizes)
+    futures = [
+        [
+            put_func(
+                pdf.iloc[
+                    row_bounds[i] : row_bounds[i + 1],
+                    col_bounds[j] : col_bounds[j + 1],
+                ]
+            )
+            for j in range(len(col_sizes))
+        ]
+        for i in range(len(row_sizes))
+    ]
+    df = from_partitions(
+        futures,
+        axis=None,
+        index=pdf.index,
+        columns=pdf.columns,
+        row_lengths=row_sizes,
+        column_widths=col_sizes,
+    )
+    return pdf, df, row_sizes, col_sizes
+
+
+def test_partition_layout_uneven():
+    pdf, df, row_sizes, col_sizes = _build_uneven_partitioned_frame()
+    layout = df.modin.partition_layout()
+
+    assert isinstance(layout, PartitionLayout)
+
+    assert layout.rows == PartitionAxisStats(
+        sizes=tuple(row_sizes), num_partitions=4, min=1, max=10, total=16
+    )
+    assert layout.columns == PartitionAxisStats(
+        sizes=tuple(col_sizes), num_partitions=3, min=1, max=5, total=8
+    )
+
+    # sizes are reported in the physical order (not sorted/rebalanced)
+    assert layout.rows.sizes == tuple(row_sizes)
+    assert layout.columns.sizes == tuple(col_sizes)
+    # the uneven partitioning is detectable
+    assert layout.rows.min < layout.rows.max
+    assert layout.columns.min < layout.columns.max
+
+    # totals agree with the frame shape and the data itself is intact
+    assert layout.rows.total == len(df) == len(pdf)
+    assert layout.columns.total == df.shape[1] == pdf.shape[1]
+    df_equals(df, pdf)
+
+    # repeated diagnostics return the same snapshot
+    assert df.modin.partition_layout() == layout
+
+
+def test_partition_layout_cache_miss():
+    pdf, df, row_sizes, col_sizes = _build_uneven_partitioned_frame()
+    modin_frame = df._query_compiler._modin_frame
+
+    # simulate a full size cache miss at both the frame and partition level
+    modin_frame._row_lengths_cache = None
+    modin_frame._column_widths_cache = None
+    for block in modin_frame._partitions.flatten():
+        block._length_cache = None
+        block._width_cache = None
+
+    layout = df.modin.partition_layout()
+
+    # sizes were computed through the standard mechanism, not taken from a cache
+    assert modin_frame._row_lengths_cache == row_sizes
+    assert modin_frame._column_widths_cache == col_sizes
+    assert layout.rows.sizes == tuple(row_sizes)
+    assert layout.columns.sizes == tuple(col_sizes)
+    assert layout.rows.total == len(pdf)
+    assert layout.columns.total == len(pdf.columns)
+    df_equals(df, pdf)
+
+
+def test_partition_layout_is_read_only():
+    pdf, df, _, _ = _build_uneven_partitioned_frame()
+    modin_frame = df._query_compiler._modin_frame
+
+    # drop all metadata caches so that diagnostics has to compute everything
+    modin_frame._row_lengths_cache = None
+    modin_frame._column_widths_cache = None
+    modin_frame.set_index_cache(None)
+    modin_frame.set_columns_cache(None)
+    for block in modin_frame._partitions.flatten():
+        block._length_cache = None
+        block._width_cache = None
+
+    partitions_before = modin_frame._partitions
+    blocks_before = modin_frame._partitions.copy()
+
+    df.modin.partition_layout()
+
+    # no repartitioning: the very same partition grid and objects are kept
+    assert modin_frame._partitions is partitions_before
+    assert modin_frame._partitions.shape == partitions_before.shape
+    for i in range(partitions_before.shape[0]):
+        for j in range(partitions_before.shape[1]):
+            assert modin_frame._partitions[i, j] is blocks_before[i, j]
+
+    # data, index and columns are unchanged
+    assert list(df.index) == list(pdf.index)
+    assert list(df.columns) == list(pdf.columns)
+    df_equals(df, pdf)
+
+
+@pytest.mark.parametrize(
+    "frame_factory",
+    [
+        lambda: pd.DataFrame(),
+        lambda: pd.DataFrame(columns=["a", "b", "c"]),
+        lambda: pd.DataFrame(index=pandas.RangeIndex(5)),
+    ],
+)
+def test_partition_layout_empty_frames(frame_factory):
+    df = frame_factory()
+    modin_frame = df._query_compiler._modin_frame
+    layout = df.modin.partition_layout()
+
+    assert isinstance(layout, PartitionLayout)
+
+    # statistics describe the frame's partition sizes, in their stored order
+    assert layout.rows.sizes == tuple(modin_frame.row_lengths)
+    assert layout.columns.sizes == tuple(modin_frame.column_widths)
+
+    # totals always equal the frame shape even for empty/deferred frames
+    assert layout.rows.total == len(df)
+    assert layout.columns.total == df.shape[1]
+    assert sum(layout.rows.sizes) == layout.rows.total
+    assert sum(layout.columns.sizes) == layout.columns.total
+
+    # explicit min/max statistics without division by zero
+    for axis_stats in (layout.rows, layout.columns):
+        assert axis_stats.num_partitions == len(axis_stats.sizes)
+        if axis_stats.num_partitions == 0:
+            assert axis_stats.sizes == ()
+            assert axis_stats.min is None
+            assert axis_stats.max is None
+            assert axis_stats.total == 0
+        else:
+            assert axis_stats.min == min(axis_stats.sizes)
+            assert axis_stats.max == max(axis_stats.sizes)
+
+    # the call works again and the empty frame content is intact
+    assert df.modin.partition_layout() == layout
+    df_equals(df, df.modin.to_pandas())
+
+
+def test_partition_layout_empty_partition_grid():
+    # an internal frame whose physical partition grid is completely empty
+    frame_cls = FactoryDispatcher.get_factory().io_cls.frame_cls
+    empty_grid = np.empty((0, 0), dtype=object)
+    query_compiler = PandasQueryCompiler(frame_cls(empty_grid))
+    df = pd.DataFrame(query_compiler=query_compiler)
+
+    layout = df.modin.partition_layout()
+
+    empty_stats = PartitionAxisStats(
+        sizes=(), num_partitions=0, min=None, max=None, total=0
+    )
+    assert layout.rows == empty_stats
+    assert layout.columns == empty_stats
+    # diagnostics must not populate the empty grid with partitions
+    assert query_compiler._modin_frame._partitions.shape == (0, 0)
+
+
+def test_partition_layout_series():
+    series = pd.Series(list(range(10)))
+    layout = series.modin.partition_layout()
+
+    assert isinstance(layout, PartitionLayout)
+    assert sum(layout.rows.sizes) == layout.rows.total == len(series) == 10
+    assert layout.columns.total == 1
+    assert layout.rows.num_partitions >= 1
+    pandas.testing.assert_series_equal(
+        series.modin.to_pandas(), pandas.Series(range(10))
+    )
+
+
+def test_partition_layout_totals_after_filtering():
+    data = test_data["int_data"]
+    modin_df, pandas_df = pd.DataFrame(data), pandas.DataFrame(data)
+
+    filtered = modin_df[modin_df.iloc[:, 0] > modin_df.iloc[:, 0].min()]
+    expected = pandas_df[pandas_df.iloc[:, 0] > pandas_df.iloc[:, 0].min()]
+
+    layout = filtered.modin.partition_layout()
+    assert layout.rows.total == len(filtered) == len(expected)
+    assert layout.columns.total == filtered.shape[1] == expected.shape[1]
+    assert len(layout.rows.sizes) == layout.rows.num_partitions
+    assert len(layout.columns.sizes) == layout.columns.num_partitions
+    df_equals(filtered, expected)

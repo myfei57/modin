@@ -24,7 +24,7 @@ CachedAccessor implements API of pandas.core.accessor.CachedAccessor
 from __future__ import annotations
 
 import pickle
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, NamedTuple, Optional, Union
 
 import pandas
 from pandas._typing import CompressionOptions, StorageOptions
@@ -38,6 +38,79 @@ from modin.utils import _inherit_docstrings
 
 if TYPE_CHECKING:
     from modin.pandas import DataFrame, Series
+
+
+class PartitionAxisStats(NamedTuple):
+    """
+    Size statistics of the physical partitions along a single axis.
+
+    Attributes
+    ----------
+    sizes : tuple of int
+        Size of every partition (number of rows for the row axis, number of
+        columns for the column axis) in the physical partitions order.
+    num_partitions : int
+        Number of partitions: ``len(sizes)``.
+    min : int or None
+        Minimal partition size. ``None`` when there are no partitions.
+    max : int or None
+        Maximal partition size. ``None`` when there are no partitions.
+    total : int
+        Sum of all the partition sizes. Always present and equal to ``0``
+        when there are no partitions, so the statistics never require
+        division by the number of partitions.
+    """
+
+    sizes: tuple[int, ...]
+    num_partitions: int
+    min: Optional[int]
+    max: Optional[int]
+    total: int
+
+
+class PartitionLayout(NamedTuple):
+    """
+    Read-only snapshot of a frame's physical partition layout.
+
+    Attributes
+    ----------
+    rows : PartitionAxisStats
+        Sizes of the row partitions (number of rows per partition).
+    columns : PartitionAxisStats
+        Sizes of the column partitions (number of columns per partition).
+    """
+
+    rows: PartitionAxisStats
+    columns: PartitionAxisStats
+
+
+def _build_partition_axis_stats(sizes) -> PartitionAxisStats:
+    """
+    Compute size statistics for partitions of one axis.
+
+    Parameters
+    ----------
+    sizes : iterable of int
+        Partition sizes in their physical order.
+
+    Returns
+    -------
+    PartitionAxisStats
+        Explicit empty statistics (``min``/``max`` are ``None``) are returned
+        for an empty partition layout instead of dividing by zero.
+    """
+    sizes = tuple(int(size) for size in sizes)
+    if len(sizes) == 0:
+        return PartitionAxisStats(
+            sizes=(), num_partitions=0, min=None, max=None, total=0
+        )
+    return PartitionAxisStats(
+        sizes=sizes,
+        num_partitions=len(sizes),
+        min=min(sizes),
+        max=max(sizes),
+        total=sum(sizes),
+    )
 
 
 class BaseSparseAccessor(ClassLogger):
@@ -228,6 +301,41 @@ class ModinAPI:
         pandas.Series or pandas.DataFrame
         """
         return self._data._to_pandas()
+
+    def partition_layout(self) -> PartitionLayout:
+        """
+        Describe the current physical partition layout of the object.
+
+        The result helps identify uneven row/column partitioning. For both
+        axes it reports the partition sizes in their current physical order,
+        along with the number of partitions, the minimal and maximal
+        partition size and the total size (the frame length or width).
+
+        Returns
+        -------
+        PartitionLayout
+            Snapshot containing ``rows`` and ``columns`` partition statistics.
+
+        Notes
+        -----
+        * The call is read-only. If a partition size is not yet cached, it is
+          computed using the standard per-partition size mechanism; the whole
+          frame is never collected to the driver and no repartitioning is
+          triggered. The data, index and columns remain unchanged.
+        * If an axis has no partitions, its statistics are explicitly empty:
+          ``num_partitions == 0``, ``min`` and ``max`` are ``None`` and
+          ``total == 0`` (no division by the number of partitions is done).
+        * The result only describes the physical layout at the time of the
+          call; the layout after subsequent operations is not guaranteed to
+          stay the same.
+        """
+        row_lengths, column_widths = (
+            self._data._query_compiler.get_partition_sizes()
+        )
+        return PartitionLayout(
+            rows=_build_partition_axis_stats(row_lengths),
+            columns=_build_partition_axis_stats(column_widths),
+        )
 
     def to_ray(self):
         """

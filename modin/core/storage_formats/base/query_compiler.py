@@ -4806,6 +4806,26 @@ class BaseQueryCompiler(
         """
         return len(self.get_axis(axis))
 
+    def get_partition_sizes(self) -> tuple[list[int], list[int]]:
+        """
+        Return the sizes of the physical row/column partitions in their current order.
+
+        Read-only introspection used to diagnose uneven partitioning: the
+        first list contains the number of rows of every row partition and the
+        second list the number of columns of every column partition. Missing
+        size metadata may be computed with the storage's standard mechanism,
+        but without collecting the data to the driver, repartitioning or
+        modifying the frame.
+
+        Returns
+        -------
+        row_lengths : list of int
+        column_widths : list of int
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not provide physical partition sizes"
+        )
+
     def take_2d_labels(
         self,
         index,
