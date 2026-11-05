@@ -184,6 +184,18 @@ class BaseFactory(object):
     @classmethod
     @doc(
         _doc_io_method_template,
+        source="a stream of Arrow RecordBatches (a pyarrow.RecordBatchReader or "
+        "an iterable of pyarrow.RecordBatch)",
+        params="batches : pyarrow.RecordBatchReader or iterable of pyarrow.RecordBatch\n"
+        "schema : pyarrow.Schema, optional",
+        method="io.from_arrow_batches",
+    )
+    def _from_arrow_batches(cls, batches, schema=None):
+        return cls.io_cls.from_arrow_batches(batches, schema=schema)
+
+    @classmethod
+    @doc(
+        _doc_io_method_template,
         source="a non-pandas object (dict, list, np.array etc...)",
         params=_doc_io_method_all_params,
         method="io.from_non_pandas",

@@ -821,6 +821,39 @@ class BaseQueryCompiler(
 
     # END From Arrow
 
+    # From Arrow RecordBatches
+    @classmethod
+    @abc.abstractmethod
+    def from_arrow_batches(cls, batches, data_cls, schema=None):
+        """
+        Build QueryCompiler from a stream of Arrow RecordBatches.
+
+        Parameters
+        ----------
+        batches : pyarrow.RecordBatchReader or iterable of pyarrow.RecordBatch
+            The stream of record batches to convert from. The batches are
+            consumed in order without being coalesced into a single local
+            Arrow Table or pandas DataFrame.
+        data_cls : type
+            :py:class:`~modin.core.dataframe.pandas.dataframe.dataframe.PandasDataframe` class
+            (or its descendant) to convert to.
+        schema : pyarrow.Schema, optional
+            The expected schema of the batches. When it is not specified, the
+            schema is taken from the reader or from the first batch. Batches
+            with incompatible column names or types must raise an error
+            reporting the offending batch index.
+
+        Returns
+        -------
+        BaseQueryCompiler
+            QueryCompiler containing data from the record batches. If the
+            stream contains no rows, the QueryCompiler is empty but still
+            carries the column and type information of the known schema.
+        """
+        pass
+
+    # END From Arrow RecordBatches
+
     # To NumPy
 
     def to_numpy(self, **kwargs):  # noqa: PR02

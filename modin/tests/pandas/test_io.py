@@ -47,9 +47,17 @@ from modin.config import (
     TestReadFromSqlServer,
 )
 from modin.db_conn import ModinDatabaseConnection, UnsupportedDatabaseException
-from modin.pandas.io import from_arrow, from_dask, from_map, from_ray, to_pandas
+from modin.pandas.io import (
+    from_arrow,
+    from_arrow_batches,
+    from_dask,
+    from_map,
+    from_ray,
+    to_pandas,
+)
 from modin.tests.test_utils import (
     current_execution_is_native,
+    df_or_series_using_native_execution,
     warns_that_defaulting_to_pandas_if,
 )
 
@@ -3249,6 +3257,251 @@ def test_from_arrow():
     _, pandas_df = create_test_dfs(TEST_DATA)
     modin_df = from_arrow(pa.Table.from_pandas(pandas_df))
     df_equals(modin_df, pandas_df)
+
+
+@pytest.fixture
+def arrow_batches_schema():
+    return pa.schema([("a", pa.int64()), ("b", pa.string()), ("c", pa.float64())])
+
+
+def _make_arrow_batch(schema, a_values, b_values, c_values):
+    return pa.RecordBatch.from_pydict(
+        {"a": a_values, "b": b_values, "c": c_values}, schema=schema
+    )
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+@pytest.mark.parametrize("source_kind", ["reader", "list", "generator", "single_batch"])
+def test_from_arrow_batches_source_kinds(source_kind, arrow_batches_schema):
+    schema = arrow_batches_schema
+    b1 = _make_arrow_batch(schema, [1, 2], ["x", "y"], [1.5, 2.5])
+    b2 = _make_arrow_batch(schema, [3, 4, 5], ["z", "w", "q"], [3.5, 4.5, 5.5])
+    expected = pa.Table.from_batches([b1, b2], schema=schema).to_pandas()
+
+    if source_kind == "reader":
+        source = pa.RecordBatchReader.from_batches(schema, [b1, b2])
+    elif source_kind == "list":
+        source = [b1, b2]
+    elif source_kind == "generator":
+        source = (batch for batch in [b1, b2])
+    else:
+        source = b1
+        expected = pa.Table.from_batches([b1], schema=schema).to_pandas()
+
+    modin_df = from_arrow_batches(source)
+    df_equals(modin_df, expected)
+    # The row order is preserved and the index is a single continuous range.
+    assert isinstance(modin_df.index, pandas.RangeIndex)
+    assert list(modin_df.index) == list(range(len(expected)))
+    assert list(modin_df["a"]) == list(expected["a"])
+    # The entry point is also available right off the modin.pandas namespace,
+    # just like 'from_arrow'.
+    import modin.pandas as modin_pd
+
+    assert callable(modin_pd.from_arrow_batches)
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_with_explicit_schema(arrow_batches_schema):
+    schema = arrow_batches_schema
+    b1 = _make_arrow_batch(schema, [1], ["x"], [1.5])
+    b2 = _make_arrow_batch(schema, [2], ["y"], [2.5])
+    modin_df = from_arrow_batches(iter([b1, b2]), schema=schema)
+    df_equals(modin_df, pa.Table.from_batches([b1, b2], schema=schema).to_pandas())
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+@pytest.mark.parametrize("modify_config", [{MinRowPartitionSize: 32}], indirect=True)
+def test_from_arrow_batches_keep_batch_partition_boundaries(modify_config):
+    # Each batch is smaller than the minimum partition size, so if batches
+    # were coalesced first the whole stream would collapse into a single
+    # row partition. Keeping one row partition per batch proves the data is
+    # ingested batch by batch (and bounds driver-side memory to one batch).
+    schema = pa.schema([("a", pa.int64())])
+    batches = [
+        pa.RecordBatch.from_pydict({"a": list(range(i * 4, i * 4 + 4))}, schema)
+        for i in range(3)
+    ]
+    modin_df = from_arrow_batches(iter(batches))
+    if df_or_series_using_native_execution(modin_df):
+        pytest.skip("Batch partition boundaries only exist in partitioned executions.")
+
+    modin_frame = modin_df._query_compiler._modin_frame
+    assert modin_frame._partitions.shape[0] == 3
+    assert list(modin_frame.row_lengths) == [4, 4, 4]
+    assert list(modin_df["a"]) == list(range(12))
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_empty_batches_keep_types(arrow_batches_schema):
+    schema = arrow_batches_schema
+    empty = _make_arrow_batch(schema, [], [], [])
+    b1 = _make_arrow_batch(schema, [1, 2], ["x", "y"], [1.5, 2.5])
+    b2 = _make_arrow_batch(schema, [3], ["z"], [3.5])
+
+    modin_df = from_arrow_batches([empty, b1, empty, b2, empty])
+    expected = pa.Table.from_batches([b1, b2], schema=schema).to_pandas()
+    df_equals(modin_df, expected)
+    assert list(modin_df.index) == [0, 1, 2]
+
+    # All batches are empty: the schema of the first batch must still be known.
+    all_empty = from_arrow_batches(iter([empty, empty]))
+    assert all_empty.shape == (0, 3)
+    assert list(all_empty.columns) == ["a", "b", "c"]
+    assert list(all_empty.dtypes) == list(
+        from_arrow(pa.Table.from_batches([], schema=schema)).dtypes
+    )
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_empty_reader(arrow_batches_schema):
+    schema = arrow_batches_schema
+    reader = pa.RecordBatchReader.from_batches(schema, [])
+    modin_df = from_arrow_batches(reader)
+    assert modin_df.shape == (0, 3)
+    assert list(modin_df.columns) == schema.names
+    df_equals(modin_df, from_arrow(pa.Table.from_batches([], schema=schema)))
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_empty_iterable_with_schema(arrow_batches_schema):
+    schema = arrow_batches_schema
+    modin_df = from_arrow_batches(iter([]), schema=schema)
+    assert modin_df.shape == (0, 3)
+    assert list(modin_df.columns) == schema.names
+    assert isinstance(modin_df.index, pandas.RangeIndex) and len(modin_df.index) == 0
+    df_equals(modin_df, from_arrow(pa.Table.from_batches([], schema=schema)))
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_empty_iterable_without_schema_raises():
+    with pytest.raises(ValueError, match="schema"):
+        from_arrow_batches(iter([]))
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+@pytest.mark.parametrize(
+    "bad_schema",
+    [
+        pa.schema([("a", pa.float64()), ("b", pa.string()), ("c", pa.float64())]),
+        pa.schema([("a", pa.int64()), ("other", pa.string()), ("c", pa.float64())]),
+    ],
+)
+def test_from_arrow_batches_schema_mismatch_reports_batch_index(
+    bad_schema, arrow_batches_schema
+):
+    schema = arrow_batches_schema
+    b1 = _make_arrow_batch(schema, [1, 2], ["x", "y"], [1.5, 2.5])
+    if bad_schema.names[1] == "b":
+        b2_data = {"a": [3.0], "b": ["z"], "c": [3.5]}
+    else:
+        b2_data = {"a": [1], "other": ["z"], "c": [3.5]}
+    b2 = pa.RecordBatch.from_pydict(b2_data, schema=bad_schema)
+    with pytest.raises(ValueError, match=r"batch #1"):
+        from_arrow_batches(iter([b1, b2]))
+
+    # An incompatibility against the caller-provided schema is batch #0.
+    with pytest.raises(ValueError, match=r"batch #0"):
+        from_arrow_batches(iter([b1]), schema=bad_schema)
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_metadata_only_difference_is_allowed():
+    # Only field/schema metadata differs: column names and types are the same.
+    schema1 = pa.schema(
+        [pa.field("a", pa.int64(), metadata={"x": "1"})],
+        metadata={"k": "v"},
+    )
+    schema2 = pa.schema([pa.field("a", pa.int64(), metadata={"x": "2"})])
+    b1 = pa.RecordBatch.from_pydict({"a": [1]}, schema=schema1)
+    b2 = pa.RecordBatch.from_pydict({"a": [2]}, schema=schema2)
+    modin_df = from_arrow_batches(iter([b1, b2]))
+    assert list(modin_df["a"]) == [1, 2]
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_bad_inputs():
+    schema = pa.schema([("a", pa.int64())])
+    batch = pa.RecordBatch.from_pydict({"a": [1]}, schema=schema)
+
+    with pytest.raises(TypeError, match="from_arrow"):
+        from_arrow_batches(pa.table({"a": [1, 2]}))
+    with pytest.raises(TypeError, match=r"Item #1"):
+        from_arrow_batches([batch, 42])
+    with pytest.raises(TypeError):
+        from_arrow_batches(42)
+    with pytest.raises(TypeError, match="schema"):
+        from_arrow_batches(iter([batch]), schema=42)
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_does_not_coalesce_to_table(arrow_batches_schema):
+    from modin.core.dataframe.pandas.dataframe.dataframe import (
+        PandasDataframe,
+    )
+    from modin.core.dataframe.pandas.partitioning.partition_manager import (
+        PandasDataframePartitionManager,
+    )
+
+    schema = arrow_batches_schema
+    b1 = _make_arrow_batch(schema, [1, 2], ["x", "y"], [1.5, 2.5])
+    b2 = _make_arrow_batch(schema, [3], ["z"], [3.5])
+
+    probe = from_arrow_batches([b1, b2])
+    if df_or_series_using_native_execution(probe):
+        pytest.skip(
+            "Native execution is local by construction and materializes one frame."
+        )
+
+    reader = pa.RecordBatchReader.from_batches(schema, [b1, b2])
+
+    # Record every per-batch DataFrame handed to the partition manager. If the
+    # stream were coalesced into a single local Arrow Table / pandas DataFrame
+    # first, we would see one call with the combined shape (3, 3).
+    converted_shapes = []
+    real_from_pandas = PandasDataframePartitionManager.from_pandas.__func__
+
+    def spy_from_pandas(cls, df, return_dims=False):
+        converted_shapes.append(df.shape)
+        return real_from_pandas(cls, df, return_dims=return_dims)
+
+    with mock.patch.object(
+        PandasDataframePartitionManager,
+        "from_pandas",
+        classmethod(spy_from_pandas),
+    ):
+        # The non-empty streaming path must not fall back to 'from_arrow',
+        # which is the Arrow Table entry point.
+        with mock.patch.object(
+            PandasDataframe,
+            "from_arrow",
+            side_effect=AssertionError(
+                "batches must not be coalesced into a single Arrow Table"
+            ),
+        ) as from_arrow_mock:
+            modin_df = from_arrow_batches(reader)
+
+    assert from_arrow_mock.call_count == 0
+    assert converted_shapes == [(2, 3), (1, 3)]
+    df_equals(modin_df, pa.Table.from_batches([b1, b2], schema=schema).to_pandas())
+
+
+@pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+def test_from_arrow_batches_consumed_lazily_in_order(arrow_batches_schema):
+    # A generator source must be pulled one batch at a time, on demand,
+    # without batches being requested eagerly up front.
+    schema = arrow_batches_schema
+    batches = [_make_arrow_batch(schema, [i], [f"s{i}"], [float(i)]) for i in range(5)]
+    requested = []
+
+    def gen():
+        for idx, batch in enumerate(batches):
+            requested.append(idx)
+            yield batch
+
+    modin_df = from_arrow_batches(gen())
+    assert requested == [0, 1, 2, 3, 4]
+    assert list(modin_df["a"]) == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.skipif(

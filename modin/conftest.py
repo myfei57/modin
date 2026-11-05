@@ -197,6 +197,10 @@ class TestQC(BaseQueryCompiler):
     def from_arrow(cls, at, data_cls):
         return cls(data_cls.from_arrow(at))
 
+    @classmethod
+    def from_arrow_batches(cls, batches, data_cls, schema=None):
+        return cls(data_cls.from_arrow_batches(batches, schema=schema))
+
     def free(self):
         pass
 

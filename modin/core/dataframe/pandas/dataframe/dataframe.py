@@ -4688,6 +4688,219 @@ class PandasDataframe(
             return np.dtype(res)
         return res
 
+    @classmethod
+    def from_arrow_batches(cls, source, schema=None):
+        """
+        Create a Modin DataFrame from a PyArrow ``RecordBatchReader`` or an
+        iterable of ``RecordBatch`` objects.
+
+        The batches are consumed lazily, one at a time and strictly in the
+        order they are produced, without being coalesced into a single local
+        Arrow Table or pandas DataFrame. Each non-empty batch is converted into
+        partitions independently, so column names, column types and the row
+        order are all preserved.
+
+        Parameters
+        ----------
+        source : pyarrow.RecordBatchReader, iterable of pyarrow.RecordBatch, or pyarrow.RecordBatch
+            The stream of Arrow record batches to build the frame from.
+        schema : pyarrow.Schema, optional
+            The expected schema of all the batches. When it is not specified,
+            the schema is taken from the ``RecordBatchReader.schema`` attribute
+            or from the first batch. Every subsequent batch must have the same
+            column names and types as the resolved schema, otherwise a
+            ``ValueError`` with the offending batch index is raised.
+
+        Returns
+        -------
+        PandasDataframe
+            New Modin DataFrame. If the source does not contain any rows the
+            returned frame is empty but still carries the column and type
+            information of the resolved schema.
+
+        Raises
+        ------
+        ValueError
+            If a batch is incompatible with the resolved schema (the batch
+            index is reported) or if the schema cannot be determined for a
+            source without data.
+        TypeError
+            If `source` is neither a ``RecordBatchReader`` nor an iterable of
+            ``RecordBatch``, if an element of the iterable is not a
+            ``RecordBatch``, or if `schema` is not a ``pyarrow.Schema``.
+        """
+        import pyarrow
+
+        if schema is not None and not isinstance(schema, pyarrow.Schema):
+            raise TypeError(
+                f"'schema' must be a pyarrow.Schema instance or None, got: {type(schema)}."
+            )
+
+        batch_iter, reader_schema = cls._normalize_arrow_batch_source(source)
+        expected_schema = schema if schema is not None else reader_schema
+
+        partition_blocks = []
+        row_lengths = []
+        column_widths = None
+        pandas_backend = None
+        total_rows = 0
+
+        for batch_idx, batch in enumerate(batch_iter):
+            if not isinstance(batch, pyarrow.RecordBatch):
+                raise TypeError(
+                    "Item #"
+                    f"{batch_idx} of the source is not a pyarrow.RecordBatch, got: {type(batch)}."
+                )
+            expected_schema = cls._check_arrow_batch_schema(
+                batch, expected_schema, batch_idx
+            )
+            if batch.num_rows == 0:
+                # An empty batch adds no partitions, but its column and type
+                # information is preserved via 'expected_schema'.
+                continue
+            # Convert the batch by itself, so that the full stream never has to
+            # be materialized as a single local Arrow Table or pandas DataFrame.
+            pdf = batch.to_pandas()
+            # Every batch is indexed independently starting from zero, so give
+            # it a globally contiguous index that matches the final frame: the
+            # partition blocks keep these internal labels when split.
+            pdf.index = pandas.RangeIndex(total_rows, total_rows + batch.num_rows)
+            total_rows += batch.num_rows
+            blocks, backend, lengths, widths = cls._partition_mgr_cls.from_pandas(
+                pdf, return_dims=True
+            )
+            if column_widths is None:
+                column_widths = widths
+            else:
+                ErrorMessage.catch_bugs_and_request_email(
+                    len(widths) != len(column_widths)
+                    or any(a != b for a, b in zip(widths, column_widths)),
+                    f"Column partition widths of batch #{batch_idx} {widths} do not "
+                    + f"match the previously seen ones {column_widths}.",
+                )
+            partition_blocks.append(blocks)
+            row_lengths.extend(lengths)
+            if pandas_backend is None:
+                pandas_backend = backend
+
+        if expected_schema is None:
+            raise ValueError(
+                "Cannot determine the schema of an empty stream of Arrow record batches. "
+                + "Please pass 'schema=pyarrow.schema([...])', or provide a "
+                + "pyarrow.RecordBatchReader (which always carries a schema) or a "
+                + "non-empty first batch."
+            )
+
+        if total_rows == 0:
+            # The source carries no data, but the schema is known: return a
+            # correctly-typed empty frame via the existing Table entry point
+            # without coalescing any batch data.
+            return cls.from_arrow(
+                pyarrow.Table.from_batches([], schema=expected_schema)
+            )
+
+        new_partitions = np.concatenate(partition_blocks, axis=0)
+        new_columns = Index.__new__(Index, data=expected_schema.names, dtype="O")
+        new_index = Index.__new__(RangeIndex, data=range(total_rows))
+        new_dtypes = pandas.Series(
+            [cls._arrow_type_to_dtype(field.type) for field in expected_schema],
+            index=expected_schema.names,
+        )
+        return cls(
+            new_partitions,
+            new_index,
+            new_columns,
+            row_lengths=row_lengths,
+            column_widths=column_widths,
+            dtypes=new_dtypes,
+            pandas_backend=pandas_backend,
+        )
+
+    @staticmethod
+    def _normalize_arrow_batch_source(source):
+        """
+        Normalize a source of Arrow record batches into an iterator and a
+        schema that can be determined without consuming the source.
+
+        Parameters
+        ----------
+        source : pyarrow.RecordBatchReader, pyarrow.RecordBatch, or iterable of pyarrow.RecordBatch
+            The stream to normalize.
+
+        Returns
+        -------
+        tuple(iterator, pyarrow.Schema or None)
+            The iterator over the batches and the schema taken from the reader.
+            The second element is ``None`` for a plain iterable (its schema can
+            only be determined from the first batch).
+
+        Raises
+        ------
+        TypeError
+            If `source` is a ``pyarrow.Table`` (use ``from_arrow`` for it) or
+            is neither a record batch reader, a record batch nor an iterable.
+        """
+        import pyarrow
+
+        if isinstance(source, pyarrow.Table):
+            raise TypeError(
+                "A pyarrow.Table is not accepted by 'from_arrow_batches', use "
+                + "'modin.pandas.from_arrow' to convert Arrow tables."
+            )
+        if isinstance(source, pyarrow.RecordBatchReader):
+            return iter(source), source.schema
+        if isinstance(source, pyarrow.RecordBatch):
+            return iter([source]), None
+        try:
+            return iter(source), None
+        except TypeError:
+            raise TypeError(
+                "'source' must be a pyarrow.RecordBatchReader, a pyarrow.RecordBatch or "
+                + f"an iterable of pyarrow.RecordBatch objects, got: {type(source)}."
+            )
+
+    @staticmethod
+    def _check_arrow_batch_schema(batch, expected_schema, batch_idx):
+        """
+        Check that the batch has the same column names and types as the
+        expected schema, or resolve the expected schema from the first batch.
+
+        Parameters
+        ----------
+        batch : pyarrow.RecordBatch
+            The batch to validate.
+        expected_schema : pyarrow.Schema or None
+            The currently expected schema. Resolved from the batch when ``None``.
+        batch_idx : int
+            Zero-based position of the batch in the source stream, reported in
+            the error message on incompatibility.
+
+        Returns
+        -------
+        pyarrow.Schema
+            The expected schema to validate the rest of the batches against.
+
+        Raises
+        ------
+        ValueError
+            If the batch has different column names or types.
+        """
+        if expected_schema is None:
+            return batch.schema
+        actual_schema = batch.schema
+        incompatible = actual_schema.names != expected_schema.names or any(
+            actual_field.type != expected_field.type
+            for actual_field, expected_field in zip(actual_schema, expected_schema)
+        )
+        if incompatible:
+            raise ValueError(
+                f"Incompatible schema of Arrow record batch #{batch_idx}: all batches "
+                + "must have the same column names and types.\n"
+                + f"Expected schema:\n{expected_schema}\n"
+                + f"Batch schema:\n{actual_schema}"
+            )
+        return expected_schema
+
     @lazy_metadata_decorator(apply_axis="both")
     def to_pandas(self):
         """

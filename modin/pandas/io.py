@@ -1044,6 +1044,54 @@ def from_arrow(at) -> DataFrame:
     return ModinObjects.DataFrame(query_compiler=FactoryDispatcher.from_arrow(at))
 
 
+@wrap_free_function_in_argument_caster("from_arrow_batches")
+def from_arrow_batches(batches, schema=None) -> DataFrame:
+    """
+    Create a Modin DataFrame from a PyArrow ``RecordBatchReader`` or an
+    iterable of ``RecordBatch`` objects, for example a service that streams
+    data back in batches.
+
+    The batches are consumed lazily, one at a time and strictly in the order
+    they are produced, without being coalesced into a single local Arrow
+    Table or pandas DataFrame. Column names, column types and the row order
+    are all preserved.
+
+    Parameters
+    ----------
+    batches : pyarrow.RecordBatchReader, iterable of pyarrow.RecordBatch, or pyarrow.RecordBatch
+        The stream of Arrow record batches to build the DataFrame from.
+    schema : pyarrow.Schema, optional
+        The expected schema of all the batches. When it is not specified, the
+        schema is taken from ``RecordBatchReader.schema`` or from the first
+        batch. If a later batch has different column names or types, an error
+        is raised that reports the offending batch index and no (partial)
+        DataFrame is returned.
+
+    Returns
+    -------
+    DataFrame
+        A new Modin DataFrame object. If the source does not contain any rows,
+        the DataFrame is empty but still carries the column and type
+        information of the resolved schema.
+
+    Raises
+    ------
+    ValueError
+        If a batch is incompatible with the resolved schema (the zero-based
+        batch index is reported), or if the source contains no data and is not
+        a ``RecordBatchReader`` while `schema` was not provided.
+    TypeError
+        If `batches` is a ``pyarrow.Table`` (use ``from_arrow`` for that), is
+        not a record batch reader / iterable of record batches, or if `schema`
+        is not a ``pyarrow.Schema``.
+    """
+    from modin.core.execution.dispatching.factories.dispatcher import FactoryDispatcher
+
+    return ModinObjects.DataFrame(
+        query_compiler=FactoryDispatcher.from_arrow_batches(batches, schema=schema)
+    )
+
+
 @wrap_free_function_in_argument_caster("from_dataframe")
 def from_dataframe(df: ProtocolDataframe) -> DataFrame:
     """
@@ -1265,6 +1313,7 @@ __all__ = [
     "from_non_pandas",
     "from_pandas",
     "from_arrow",
+    "from_arrow_batches",
     "from_dataframe",
     "to_pickle",
     "to_pandas",

@@ -28,6 +28,7 @@ def test_base_abstract_methods():
         "to_pandas",
         "from_pandas",
         "from_arrow",
+        "from_arrow_batches",
         "default_to_pandas",
         "from_interchange_dataframe",
         "to_interchange_dataframe",

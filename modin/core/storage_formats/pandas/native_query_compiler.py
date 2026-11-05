@@ -217,6 +217,53 @@ class NativeQueryCompiler(BaseQueryCompiler):
     def from_arrow(cls, at, data_cls):
         return cls(at.to_pandas())
 
+    @classmethod
+    def from_arrow_batches(cls, batches, data_cls, schema=None):
+        import pyarrow
+
+        from modin.core.dataframe.pandas.dataframe.dataframe import PandasDataframe
+
+        if schema is not None and not isinstance(schema, pyarrow.Schema):
+            raise TypeError(
+                f"'schema' must be a pyarrow.Schema instance or None, got: {type(schema)}."
+            )
+
+        batch_iter, reader_schema = PandasDataframe._normalize_arrow_batch_source(
+            batches
+        )
+        expected_schema = schema if schema is not None else reader_schema
+
+        frames = []
+        total_rows = 0
+        for batch_idx, batch in enumerate(batch_iter):
+            if not isinstance(batch, pyarrow.RecordBatch):
+                raise TypeError(
+                    "Item #"
+                    f"{batch_idx} of the source is not a pyarrow.RecordBatch, got: {type(batch)}."
+                )
+            expected_schema = PandasDataframe._check_arrow_batch_schema(
+                batch, expected_schema, batch_idx
+            )
+            total_rows += batch.num_rows
+            if batch.num_rows > 0:
+                frames.append(batch.to_pandas())
+
+        if expected_schema is None:
+            raise ValueError(
+                "Cannot determine the schema of an empty stream of Arrow record batches. "
+                + "Please pass 'schema=pyarrow.schema([...])', or provide a "
+                + "pyarrow.RecordBatchReader (which always carries a schema) or a "
+                + "non-empty first batch."
+            )
+
+        if total_rows == 0:
+            return cls(
+                pyarrow.Table.from_batches([], schema=expected_schema).to_pandas()
+            )
+        # Native execution is inherently local, so the data is assembled here
+        # the same way 'from_arrow' materializes a whole Arrow Table.
+        return cls(pandas.concat(frames, ignore_index=True))
+
     def free(self):
         return
 

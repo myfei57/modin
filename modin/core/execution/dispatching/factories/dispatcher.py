@@ -216,6 +216,11 @@ class FactoryDispatcher(object):
         return cls.get_factory()._from_arrow(at)
 
     @classmethod
+    @_inherit_docstrings(factories.BaseFactory._from_arrow_batches)
+    def from_arrow_batches(cls, batches, schema=None):
+        return cls.get_factory()._from_arrow_batches(batches, schema=schema)
+
+    @classmethod
     @_inherit_docstrings(factories.BaseFactory._from_non_pandas)
     def from_non_pandas(cls, *args, **kwargs):
         return cls.get_factory()._from_non_pandas(*args, **kwargs)

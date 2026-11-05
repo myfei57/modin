@@ -116,6 +116,34 @@ class BaseIO:
         return cls.query_compiler_cls.from_arrow(at, cls.frame_cls)
 
     @classmethod
+    def from_arrow_batches(cls, batches, schema=None):
+        """
+        Create a Modin `query_compiler` from a `pyarrow.RecordBatchReader`
+        or an iterable of `pyarrow.RecordBatch` objects.
+
+        The batches are consumed in order without being coalesced into a
+        single local Arrow Table or pandas DataFrame.
+
+        Parameters
+        ----------
+        batches : pyarrow.RecordBatchReader or iterable of pyarrow.RecordBatch
+            The stream of record batches to convert from.
+        schema : pyarrow.Schema, optional
+            The expected schema of the batches. When it is not specified, the
+            schema is taken from the reader or from the first batch. Batches
+            with incompatible column names or types raise an error reporting
+            the offending batch index.
+
+        Returns
+        -------
+        BaseQueryCompiler
+            QueryCompiler containing data from the record batches. If the
+            stream contains no rows, the QueryCompiler is empty but still
+            carries the column and type information of the known schema.
+        """
+        return cls.query_compiler_cls.from_arrow_batches(batches, cls.frame_cls, schema)
+
+    @classmethod
     def from_interchange_dataframe(cls, df):
         """
         Create a Modin QueryCompiler from a DataFrame supporting the DataFrame exchange protocol `__dataframe__()`.
