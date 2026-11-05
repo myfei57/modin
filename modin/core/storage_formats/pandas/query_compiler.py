@@ -1141,6 +1141,68 @@ class PandasQueryCompiler(BaseQueryCompiler):
         new_modin_frame = new_modin_frame.reduce(axis=0, function=lambda df: df.sum())
         return self.__constructor__(new_modin_frame, shape_hint="column")
 
+    def isna_cooccurrence(self, columns):
+        """
+        Count pairwise co-occurrences of missing values for the specified columns.
+
+        Every row partition computes a local count matrix on its own data and the
+        local matrices are merged by summation, so the whole dataset is never
+        collected into a single process.
+
+        Parameters
+        ----------
+        columns : list of labels
+            Columns to count the missing-value co-occurrences for, in the result
+            ordering. The frontend guarantees that every label exists in
+            ``self.columns`` exactly once.
+
+        Returns
+        -------
+        PandasQueryCompiler
+            Query compiler holding a single row of ``len(columns) ** 2``
+            non-negative integer counts. The row stores a flattened (C-order)
+            pairwise matrix: element ``i * len(columns) + j`` is the number of
+            rows where both ``columns[i]`` and ``columns[j]`` are missing.
+        """
+        # Positions are computed manually instead of relying on
+        # ``get_indexer_for`` so that unrelated duplicate column labels of the
+        # frame do not break the selection.
+        frame_columns = self.columns
+        col_positions = np.asarray(
+            [int(np.flatnonzero(frame_columns == column)[0]) for column in columns],
+            dtype=np.int64,
+        )
+        subframe = self.getitem_column_array(
+            col_positions, numeric=True
+        )._modin_frame
+
+        matrix_size = len(columns)
+
+        if self.get_axis_len(0) == 0:
+            # An empty frame has no row partitions to map over, so build the
+            # all-zero matrix directly from the (metadata-only) shape.
+            zero_row = pandas.DataFrame(
+                np.zeros((1, matrix_size**2), dtype=np.int64)
+            )
+            return self.from_pandas(zero_row, type(self._modin_frame))
+
+        def map_partition(df):
+            # The positional selection keeps labels but not necessarily their
+            # requested order, so the order is restored here explicitly.
+            mask = df[columns].isna().to_numpy(dtype=np.int64)
+            local_matrix = mask.T @ mask
+            return pandas.DataFrame(local_matrix.reshape(1, matrix_size**2))
+
+        # Apply the kernel to each row partition with all of its columns gathered
+        # together (gathering happens on workers along axis 1, only the resulting
+        # ``matrix_size ** 2`` counts ever leave the partition), then merge the
+        # per-partition matrices by summation.
+        local_counts = subframe.apply_full_axis(
+            axis=1, func=map_partition, keep_partitioning=False, num_splits=1
+        )
+        merged_counts = local_counts.reduce(axis=0, function=lambda df: df.sum())
+        return self.__constructor__(merged_counts)
+
     def skew(self, axis, **kwargs):
         if axis is None:
             return self.default_to_pandas(pandas.DataFrame.skew, axis=axis, **kwargs)

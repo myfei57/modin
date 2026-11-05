@@ -32,6 +32,8 @@ _MODIN_EXTRA_ATTRIBUTES = (
     "is_backend_pinned",
     "pin_backend",
     "unpin_backend",
+    # isna_cooccurrence - Modin-specific distributed pairwise missing value statistics
+    "isna_cooccurrence",
 )
 
 

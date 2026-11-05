@@ -1185,6 +1185,85 @@ class DataFrame(BasePandasDataset):
         """
         return super(DataFrame, self).isnull()
 
+    def isna_cooccurrence(
+        self, columns: Sequence[Hashable]
+    ) -> pandas.DataFrame:  # noqa: PR01
+        """
+        Count rows in which the specified columns are missing simultaneously.
+
+        For every pair of the given columns, count the number of rows in which
+        both values are missing according to the same missing-value rules as
+        ``DataFrame.isna``. The computation is distributed: each row partition
+        computes a local count matrix and the matrices are afterwards merged by
+        summation, so the whole dataset is never collected on a single machine.
+
+        Parameters
+        ----------
+        columns : sequence of labels
+            Ordered sequence of column names without repetitions. Every name must
+            exist in the frame and must identify a single column (frames with
+            duplicated column labels are rejected for the affected names). An
+            empty sequence results in an empty square matrix.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Square integer matrix indexed and labeled by ``columns`` in the
+            given order. The value at ``(columns[i], columns[j])`` is the number
+            of rows where both columns are missing, and the diagonal holds the
+            number of missing values of each respective column. Every entry is
+            zero for a frame without rows.
+
+        Raises
+        ------
+        TypeError
+            If ``columns`` is not a sequence of labels (for example, a single
+            string).
+        KeyError
+            If any of the requested column names does not exist in the frame.
+        ValueError
+            If ``columns`` contains repeated names or if a requested label
+            matches more than one column of the frame.
+        """
+        if isinstance(columns, (str, bytes)) or not is_list_like(columns):
+            raise TypeError(
+                "'columns' must be a sequence of column labels, "
+                + f"got object of type: {type(columns).__name__}"
+            )
+        columns = list(columns)
+
+        labels = pandas.Index(columns)
+        if not labels.is_unique:
+            duplicated = labels[labels.duplicated(keep=False)].unique().tolist()
+            raise ValueError(
+                "'columns' must not contain duplicate column names, "
+                + f"duplicated labels: {duplicated}"
+            )
+
+        frame_columns = self.columns
+        for column in columns:
+            matches = frame_columns == column
+            if not matches.any():
+                raise KeyError(
+                    f"Column {column!r} does not exist in the DataFrame"
+                )
+            if matches.sum() > 1:
+                raise ValueError(
+                    f"Column label {column!r} is not unique in the DataFrame; "
+                    + "rename the duplicated columns before using this method."
+                )
+
+        matrix_size = len(columns)
+        if matrix_size == 0:
+            return pandas.DataFrame()
+
+        counts = self._query_compiler.isna_cooccurrence(columns).to_pandas()
+        matrix = counts.to_numpy().reshape(matrix_size, matrix_size)
+        matrix_labels = pandas.Index(columns)
+        return pandas.DataFrame(
+            matrix, index=matrix_labels, columns=matrix_labels
+        )
+
     def iterrows(self) -> Iterable[tuple[Hashable, Series]]:  # noqa: D200
         """
         Iterate over ``DataFrame`` rows as (index, ``Series``) pairs.
