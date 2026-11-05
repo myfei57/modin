@@ -45,10 +45,20 @@ class ExperimentalPandasCSVGlobParser(PandasCSVParser):
         warnings.filterwarnings("ignore")
         num_splits = kwargs.pop("num_splits", None)
         index_col = kwargs.get("index_col", None)
+        # `include_path_column` is a Modin-only extension, pop it before
+        # passing the rest of the kwargs to `pandas.read_csv`. The dispatcher
+        # either passes a resolved column name or `False`, so an explicit
+        # check against `False` is required (note that `False is not None`
+        # and `False in df.columns` may both be true).
+        path_column_name = kwargs.pop("include_path_column", None)
+        add_path_column = path_column_name is not None and path_column_name is not False
 
         # `single_worker_read` just pass filename via chunks; need check
         if isinstance(chunks, str):
-            return pandas.read_csv(chunks, **kwargs)
+            pandas_df = pandas.read_csv(chunks, **kwargs)
+            if add_path_column:
+                pandas_df[path_column_name] = chunks
+            return pandas_df
 
         # pop `compression` from kwargs because `bio` below is uncompressed
         compression = kwargs.pop("compression", "infer")
@@ -63,15 +73,25 @@ class ExperimentalPandasCSVGlobParser(PandasCSVParser):
                         header = b""
                     bio.seek(start)
                     to_read = header + bio.read(end - start)
-                pandas_dfs.append(pandas.read_csv(BytesIO(to_read), **kwargs))
+                chunk_df = pandas.read_csv(BytesIO(to_read), **kwargs)
+                # A single task may process chunks that belong to different
+                # input files, so the source path has to be assigned per
+                # chunk (i.e. per file), right after parsing the chunk and
+                # before the data frames are concatenated.
+                if add_path_column:
+                    chunk_df[path_column_name] = fname
+                pandas_dfs.append(chunk_df)
             else:
                 # This only happens when we are reading with only one worker (Default)
-                return pandas.read_csv(
+                pandas_df = pandas.read_csv(
                     fname,
                     compression=compression,
                     storage_options=storage_options,
                     **kwargs,
                 )
+                if add_path_column:
+                    pandas_df[path_column_name] = fname
+                return pandas_df
 
         # Combine read in data.
         if len(pandas_dfs) > 1:
@@ -79,7 +99,10 @@ class ExperimentalPandasCSVGlobParser(PandasCSVParser):
         elif len(pandas_dfs) > 0:
             pandas_df = pandas_dfs[0]
         else:
-            pandas_df = pandas.DataFrame()
+            columns = list(kwargs.get("names") or [])
+            pandas_df = pandas.DataFrame(columns=columns)
+            if add_path_column:
+                pandas_df[path_column_name] = pandas.Series(dtype=object)
 
         # Set internal index.
         if index_col is not None:
@@ -87,7 +110,19 @@ class ExperimentalPandasCSVGlobParser(PandasCSVParser):
         else:
             # The lengths will become the RangeIndex
             index = len(pandas_df)
-        return _split_result_for_readers(1, num_splits, pandas_df) + [
+
+        if add_path_column and path_column_name in pandas_df.columns:
+            # Split only the original CSV columns into `num_splits` blocks and
+            # return the path column as a separate extra last block, so that
+            # `usecols`, `dtype`, `converters`, `index_col` etc. never touch
+            # the synthetic column.
+            result_splits = _split_result_for_readers(
+                1, num_splits, pandas_df.drop(columns=path_column_name)
+            )
+            result_splits.append(pandas_df[[path_column_name]])
+        else:
+            result_splits = _split_result_for_readers(1, num_splits, pandas_df)
+        return result_splits + [
             index,
             pandas_df.dtypes,
         ]

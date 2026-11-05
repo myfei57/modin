@@ -18,7 +18,7 @@ import glob
 import os
 import warnings
 from contextlib import ExitStack
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import fsspec
 import pandas
@@ -50,6 +50,13 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
         new_query_compiler : BaseQueryCompiler
             Query compiler with imported data for further processing.
         """
+        # `include_path_column` is a Modin-only extension of ``read_csv``, so
+        # it must never be forwarded to ``pandas.read_csv`` neither here nor
+        # in the worker parser functions.
+        path_column_name = cls._get_path_column_name(
+            kwargs.pop("include_path_column", False)
+        )
+
         # Ensures that the file is a string file path. Otherwise, default to pandas.
         filepath_or_buffer = cls.get_path_or_buffer(stringify_path(filepath_or_buffer))
         if isinstance(filepath_or_buffer, str):
@@ -72,6 +79,14 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
                 filepath_or_buffer, kwargs.get("storage_options")
             )
         elif not cls.pathlib_or_pypath(filepath_or_buffer):
+            if path_column_name is not None:
+                # The source path column can only be built from the input
+                # file paths, which are unavailable when reading from a
+                # buffer.
+                raise NotImplementedError(
+                    "`include_path_column` is not supported when reading from a "
+                    "file-like buffer, please provide a file path or a glob pattern."
+                )
             return cls.single_worker_read(
                 filepath_or_buffer,
                 reason=cls.BUFFER_UNSUPPORTED_MSG,
@@ -89,6 +104,10 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
 
         chunksize = kwargs.get("chunksize")
         if chunksize is not None:
+            if path_column_name is not None:
+                raise NotImplementedError(
+                    "`include_path_column` is not supported together with `chunksize`."
+                )
             return cls.single_worker_read(
                 filepath_or_buffer,
                 reason="`chunksize` parameter is not supported",
@@ -97,6 +116,11 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
 
         skiprows = kwargs.get("skiprows")
         if skiprows is not None and not isinstance(skiprows, int):
+            if path_column_name is not None:
+                raise NotImplementedError(
+                    "`include_path_column` is not supported together with a "
+                    "non-integer `skiprows` value."
+                )
             return cls.single_worker_read(
                 filepath_or_buffer,
                 reason="Non-integer `skiprows` value not supported",
@@ -132,7 +156,21 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
         pd_df_metadata = pandas.read_csv(
             filepath_or_buffer, **dict(kwargs, nrows=1, skipfooter=0)
         )
-        column_names = pd_df_metadata.columns
+        # These are the columns the result will contain after `names`,
+        # `usecols` and `index_col` resolution, i.e. the columns the path
+        # column must be checked against and appended to.
+        original_column_names = pd_df_metadata.columns
+        if (
+            path_column_name is not None
+            and path_column_name in original_column_names
+        ):
+            raise ValueError(
+                f"The path column name {path_column_name!r} specified in "
+                "`include_path_column` is already present in the input data "
+                "columns. Pass a different name to avoid overwriting the "
+                "existing column."
+            )
+        column_names = original_column_names
         skipfooter = kwargs.get("skipfooter", None)
         skiprows = kwargs.pop("skiprows", None)
         usecols_md = cls._validate_usecols_arg(usecols)
@@ -152,6 +190,9 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
             skiprows=None,
             parse_dates=parse_dates,
             usecols=usecols,
+            include_path_column=(
+                path_column_name if path_column_name is not None else False
+            ),
         )
         encoding = kwargs.get("encoding", None)
         quotechar = kwargs.get("quotechar", '"').encode(
@@ -191,10 +232,17 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
                     skip_header = 0
             if kwargs.get("encoding", None) is not None:
                 partition_kwargs["skiprows"] = 1
-            # Launch tasks to read partitions
+            # Launch tasks to read partitions. The metadata describes the
+            # original CSV columns only, the path column (if requested) is
+            # added afterwards as an extra last column block.
             column_widths, num_splits = cls._define_metadata(
-                pd_df_metadata, column_names
+                pd_df_metadata, original_column_names
             )
+            if path_column_name is not None:
+                column_names = original_column_names.append(
+                    pandas.Index([path_column_name])
+                )
+                column_widths = [*column_widths, 1]
 
             args = {
                 "num_splits": num_splits,
@@ -214,12 +262,16 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
             partition_ids = [None] * len(splits)
             index_ids = [None] * len(splits)
             dtypes_ids = [None] * len(splits)
+            # One extra remote object is returned for the path column block.
+            num_returns = num_splits + 2 + (
+                1 if path_column_name is not None else 0
+            )
             for idx, chunks in enumerate(splits):
                 args.update({"chunks": chunks})
                 *partition_ids[idx], index_ids[idx], dtypes_ids[idx] = cls.deploy(
                     func=cls.parse,
                     f_kwargs=args,
-                    num_returns=num_splits + 2,
+                    num_returns=num_returns,
                 )
 
         # Compute the index based on a sum of the lengths of each partition (by default)
@@ -260,6 +312,36 @@ class ExperimentalCSVGlobDispatcher(CSVDispatcher):
         if index_col is None:
             new_query_compiler._modin_frame.synchronize_labels(axis=0)
         return new_query_compiler
+
+    @staticmethod
+    def _get_path_column_name(include_path_column) -> Optional[str]:
+        """
+        Resolve the `include_path_column` parameter to a column name or `None`.
+
+        Parameters
+        ----------
+        include_path_column : bool or str
+            Raw value of the `include_path_column` parameter:
+            `False`/`None` disables the feature; `True` adds a column with
+            the default name ``"path"``; a string value is used as the
+            column name as is.
+
+        Returns
+        -------
+        str or None
+            Name of the column that will store the source file path for
+            every read row, or `None` if the feature is disabled.
+        """
+        if include_path_column is False or include_path_column is None:
+            return None
+        if include_path_column is True:
+            return "path"
+        if isinstance(include_path_column, str):
+            return include_path_column
+        raise TypeError(
+            "`include_path_column` must be either a boolean or a string with "
+            f"the column name, got: {include_path_column!r}."
+        )
 
     @classmethod
     def file_exists(cls, file_path: str, storage_options=None) -> bool:

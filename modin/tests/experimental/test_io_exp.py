@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 import json
+import os
 import platform
 from pathlib import Path
 
@@ -20,7 +21,8 @@ import pytest
 from pandas._testing import ensure_clean
 
 import modin.experimental.pandas as pd
-from modin.config import AsyncReadMode, Engine
+from modin.config import AsyncReadMode, Engine, NPartitions
+from modin.experimental.core.io import ExperimentalCSVGlobDispatcher
 from modin.tests.pandas.utils import (
     df_equals,
     eval_general,
@@ -167,6 +169,270 @@ class TestCsvGlob:
         else:
             modin_df = pd.read_csv_glob(time_parsing_csv_path, parse_dates=parse_dates)
             df_equals(modin_df, pandas_df)
+
+    def test_read_csv_glob_path_column(self):
+        path_col = "source_path"
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path, include_path_column=path_col
+        )
+        result = modin_df._to_pandas()
+
+        # The source path column must be the last column and its values are
+        # normalized absolute file paths.
+        assert result.columns[-1] == path_col
+        assert list(result.columns[:-1]) == ["col1", "col2", "col3", "col4"]
+        assert result[path_col].dtype == object
+        expected_paths = {os.path.abspath(fname) for fname in pytest.files}
+        assert set(result[path_col]) == expected_paths
+        assert len(result) == len(pytest.files) * 11
+
+        # Every row attributed to a file matches the data of that very file,
+        # and the within-file order is preserved.
+        data_columns = ["col1", "col2", "col3", "col4"]
+        for fname in expected_paths:
+            expected = pandas.read_csv(fname)
+            actual = result.loc[result[path_col] == fname, data_columns]
+            pandas.testing.assert_frame_equal(
+                actual.reset_index(drop=True), expected.reset_index(drop=True)
+            )
+
+    def test_read_csv_glob_path_column_default_name(self):
+        modin_df = pd.read_csv_glob(pytest.glob_path, include_path_column=True)
+        result = modin_df._to_pandas()
+        assert result.columns[-1] == "path"
+        assert set(result["path"]) == {
+            os.path.abspath(fname) for fname in pytest.files
+        }
+
+    def test_read_csv_glob_path_column_disabled_by_default(self):
+        modin_df = pd.read_csv_glob(pytest.glob_path)
+        assert list(modin_df.columns) == ["col1", "col2", "col3", "col4"]
+
+    def test_read_csv_glob_path_column_name_conflict(self):
+        with pytest.raises(ValueError, match="already present"):
+            pd.read_csv_glob(pytest.glob_path, include_path_column="col1")
+
+    def test_read_csv_glob_path_column_invalid_value(self):
+        with pytest.raises(TypeError):
+            pd.read_csv_glob(pytest.glob_path, include_path_column=42)
+
+    def test_read_csv_glob_path_column_csv_options(self):
+        path_col = "source_file"
+
+        # `usecols` with column names, `dtype` and `converters` must apply to
+        # the original CSV columns only and never leak to the path column.
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path,
+            include_path_column=path_col,
+            usecols=["col1", "col2"],
+            dtype={"col1": "float64"},
+            converters={"col2": str},
+        )
+        result = modin_df._to_pandas()
+        assert list(result.columns) == ["col1", "col2", path_col]
+        assert result["col1"].dtype == np.float64
+        assert result[path_col].dtype == object
+        read_kwargs = {
+            "usecols": ["col1", "col2"],
+            "dtype": {"col1": "float64"},
+            "converters": {"col2": str},
+        }
+        for fname in set(result[path_col]):
+            expected = pandas.read_csv(fname, **read_kwargs)
+            actual = result.loc[
+                result[path_col] == fname, ["col1", "col2"]
+            ]
+            pandas.testing.assert_frame_equal(
+                actual.reset_index(drop=True), expected.reset_index(drop=True)
+            )
+
+        # Integer `usecols` must not select the synthetic column either.
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path, include_path_column=path_col, usecols=[0, 3]
+        )
+        assert list(modin_df.columns) == ["col1", "col4", path_col]
+
+        # `index_col` must not turn the path column into an index level.
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path, include_path_column=path_col, index_col="col3"
+        )
+        result = modin_df._to_pandas()
+        assert list(result.columns) == ["col1", "col2", "col4", path_col]
+        assert result.index.name == "col3"
+        for fname in set(result[path_col]):
+            expected = pandas.read_csv(fname, index_col="col3")
+            actual = result.loc[result[path_col] == fname].drop(
+                columns=path_col
+            )
+            pandas.testing.assert_frame_equal(
+                actual.reset_index(), expected.reset_index()
+            )
+
+        # Zero data columns (the only selected column becomes the index):
+        # the path column remains the sole regular column.
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path,
+            include_path_column=path_col,
+            usecols=[0],
+            index_col=0,
+        )
+        result = modin_df._to_pandas()
+        assert list(result.columns) == [path_col]
+        assert len(result) == len(pytest.files) * 11
+        for fname in set(result[path_col]):
+            expected = pandas.read_csv(fname, usecols=[0], index_col=0)
+            expected[path_col] = fname
+            actual = result.loc[result[path_col] == fname]
+            pandas.testing.assert_frame_equal(
+                actual.reset_index(), expected.reset_index()
+            )
+
+        # A name colliding with a column dropped by `usecols` is allowed,
+        # i.e. the collision check uses the actual resulting columns.
+        modin_df = pd.read_csv_glob(
+            pytest.glob_path, include_path_column="col1", usecols=["col2"]
+        )
+        assert list(modin_df.columns) == ["col2", "col1"]
+
+    def test_read_csv_glob_path_column_single_file(self):
+        fname = os.path.abspath(pytest.files[0])
+        modin_df = pd.read_csv_glob(
+            pytest.files[0], include_path_column="source_file"
+        )
+        result = modin_df._to_pandas()
+        assert result.columns[-1] == "source_file"
+        assert len(result) == 11
+        assert (result["source_file"] == fname).all()
+        pandas.testing.assert_frame_equal(
+            result.drop(columns="source_file").reset_index(drop=True),
+            pandas.read_csv(fname).reset_index(drop=True),
+        )
+
+    def test_read_csv_glob_path_column_cross_file_partitions(self):
+        # Force row partitions to span multiple files, so a single worker
+        # task reads chunks coming from different input files.
+        old_npartitions = NPartitions.get()
+        NPartitions.put(2)
+        try:
+            modin_df = pd.read_csv_glob(
+                pytest.glob_path, include_path_column="source_file"
+            )
+            result = modin_df._to_pandas()
+        finally:
+            NPartitions.put(old_npartitions)
+
+        data_columns = ["col1", "col2", "col3", "col4"]
+        assert len(result) == len(pytest.files) * 11
+        for fname in {os.path.abspath(f) for f in pytest.files}:
+            expected = pandas.read_csv(fname)
+            actual = result.loc[result["source_file"] == fname, data_columns]
+            assert len(actual) == 11
+            pandas.testing.assert_frame_equal(
+                actual.reset_index(drop=True), expected.reset_index(drop=True)
+            )
+
+    def test_read_csv_glob_path_column_irregular_files(self, tmp_path):
+        # Files with different numbers of rows, including a completely empty
+        # (0 bytes) file.
+        specs = {
+            "data_000.csv": 4,
+            "data_001.csv": 2,
+            "data_002.csv": 0,
+        }
+        for name, nrows in specs.items():
+            frame = pandas.DataFrame(
+                {
+                    "a": [f"{name}:{i}" for i in range(nrows)],
+                    "b": range(nrows),
+                }
+            )
+            frame.to_csv(tmp_path / name, index=False)
+        # overwrite the last file with a truly empty file
+        (tmp_path / "data_002.csv").write_bytes(b"")
+
+        pattern = str(tmp_path / "data_*.csv")
+        path_col = "source_file"
+        modin_df = pd.read_csv_glob(pattern, include_path_column=path_col)
+        result = modin_df._to_pandas()
+
+        assert list(result.columns) == ["a", "b", path_col]
+        assert len(result) == 6
+        present_paths = {
+            os.path.abspath(str(tmp_path / name))
+            for name in ("data_000.csv", "data_001.csv")
+        }
+        assert set(result[path_col]) == present_paths
+        # The empty file contributes no rows and never appears as a source.
+        assert (
+            os.path.abspath(str(tmp_path / "data_002.csv"))
+            not in result[path_col].values
+        )
+        for name, nrows in (("data_000.csv", 4), ("data_001.csv", 2)):
+            fname = os.path.abspath(str(tmp_path / name))
+            expected = pandas.read_csv(fname)
+            actual = result.loc[
+                result[path_col] == fname, ["a", "b"]
+            ].reset_index(drop=True)
+            assert len(actual) == nrows
+            pandas.testing.assert_frame_equal(actual, expected)
+
+    @pytest.mark.parametrize("nrows", [6, 100])
+    def test_read_csv_glob_path_column_nrows(self, tmp_path, nrows):
+        names = [f"data_{i:03d}.csv" for i in range(3)]
+        for file_idx, name in enumerate(names):
+            frame = pandas.DataFrame(
+                {
+                    "a": [f"f{file_idx}-r{row_idx}" for row_idx in range(4)],
+                    "b": range(4 * file_idx, 4 * file_idx + 4),
+                }
+            )
+            frame.to_csv(tmp_path / name, index=False)
+
+        pattern = str(tmp_path / "data_*.csv")
+        path_col = "source_file"
+        modin_df = pd.read_csv_glob(
+            pattern, include_path_column=path_col, nrows=nrows
+        )
+        result = modin_df._to_pandas().reset_index(drop=True)
+
+        expected_total = min(nrows, 12)
+        assert len(result) == expected_total
+
+        # Replay the truncation in the exact same file order Modin uses.
+        ordered_files = ExperimentalCSVGlobDispatcher.get_path(pattern)
+        expected_parts = []
+        remaining = expected_total
+        for fname in ordered_files:
+            if remaining == 0:
+                break
+            part = pandas.read_csv(fname).head(remaining)
+            part[path_col] = fname
+            expected_parts.append(part)
+            remaining -= len(part)
+        expected = pandas.concat(expected_parts).reset_index(drop=True)
+
+        pandas.testing.assert_frame_equal(
+            result[["a", "b", path_col]], expected
+        )
+
+    def test_get_path_preserves_remote_protocol(self):
+        import fsspec
+
+        dir_name = "/modin_csv_glob_path_column_test/"
+        fs = fsspec.filesystem("memory")
+        try:
+            with fs.open(f"{dir_name}data_0.csv", "wt") as f:
+                f.write("a,b\n1,2\n3,4\n")
+            with fs.open(f"{dir_name}data_1.csv", "wt") as f:
+                f.write("a,b\n5,6\n")
+            paths = ExperimentalCSVGlobDispatcher.get_path(
+                f"memory://{dir_name}data_*.csv"
+            )
+            assert len(paths) == 2
+            assert all(path.startswith("memory://") for path in paths)
+        finally:
+            if fs.exists(dir_name):
+                fs.rm(dir_name, recursive=True)
 
 
 @pytest.mark.skipif(

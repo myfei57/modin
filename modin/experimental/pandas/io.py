@@ -231,6 +231,7 @@ def _make_parser_func(sep: str, funcname: str) -> Callable:
         float_precision=None,
         storage_options: StorageOptions = None,
         dtype_backend=lib.no_default,
+        include_path_column: Union[bool, str] = False,
     ) -> DataFrame:
         # ISSUE #2408: parse parameter shared with pandas read_csv and read_table and update with provided args
         _pd_read_csv_signature = {
@@ -240,8 +241,12 @@ def _make_parser_func(sep: str, funcname: str) -> Callable:
         if f_locals.get("sep", sep) is False:
             f_locals["sep"] = "\t"
 
+        # `include_path_column` is a Modin-only extension and so is not part of
+        # the ``pandas.read_csv`` signature, extract it explicitly to avoid
+        # passing the synthetic column down to the file parser.
+        include_path_column = f_locals.get("include_path_column", False)
         kwargs = {k: v for k, v in f_locals.items() if k in _pd_read_csv_signature}
-        return _read(**kwargs)
+        return _read(include_path_column=include_path_column, **kwargs)
 
     parser_func.__doc__ = _read.__doc__
     parser_func.__name__ = funcname
@@ -259,6 +264,23 @@ def _read(**kwargs) -> DataFrame:
     ----------
     **kwargs : dict
         Keyword arguments in `modin.pandas.read_csv`.
+    include_path_column : bool or str, default: False
+        Add a column with the full normalized path of the source file for
+        every read row. The column is appended as the last column of the
+        resulting frame and is filled in parallel on the workers, without
+        collecting the whole dataset on a single machine.
+
+        - If `False` (the default), no column is added and the function
+          behaves exactly like the regular ``read_csv_glob``.
+        - If `True`, a column named ``"path"`` is added.
+        - If a string, a column with that name is added.
+
+        The path preserves the protocol for remote locations (e.g.
+        ``"s3://bucket/key.csv"``). The usual `usecols`, `dtype`,
+        `converters` and `index_col` arguments apply only to the original
+        CSV columns, the path column is never passed to the file parser.
+        A `ValueError` is raised if the path column name collides with a
+        column already present in the resulting frame.
 
     Returns
     -------
@@ -283,11 +305,14 @@ def _read(**kwargs) -> DataFrame:
     4652011       NaN  2020-12-31 23:31:29  ...        39.50                   0.0
     4652012       NaN  2020-12-31 23:12:48  ...        20.64                   0.0
 
-    [4652013 rows x 18 columns]
+    [4652012 rows x 18 columns]
     """
     from modin.core.execution.dispatching.factories.dispatcher import FactoryDispatcher
 
-    pd_obj = FactoryDispatcher.read_csv_glob(**kwargs)
+    include_path_column = kwargs.pop("include_path_column", False)
+    pd_obj = FactoryDispatcher.read_csv_glob(
+        include_path_column=include_path_column, **kwargs
+    )
     # This happens when `read_csv` returns a TextFileReader object for iterating through
     if isinstance(pd_obj, pandas.io.parsers.TextFileReader):
         reader = pd_obj.read
